@@ -48,15 +48,51 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+PAT = PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-## Usage
-with open(..., "rb") as f:
-    num_processes = 4
-    boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+def pretokenize(
+        
+):
+    pass
 
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        # Run pre-tokenization on your chunk and store the counts for each pre-token
+def process_chunk(
+    
+):
+
+    mini_chunk_size = 4096
+
+    
+
+    return NotImplementedError
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str]
+) -> tuple[
+    dict[int,bytes],
+    list[tuple[bytes, bytes]],
+]:
+    """Train Byte-pair Encoder, given corpus path & targeted vocab_size
+
+    Args:
+        - input_path : Path to corpus
+        - vocab_size : Targetted output vocab size
+        - special_tokens : List of special tokens
+
+    Returns:
+        - vocab: dict[int, bytes] : The resulting vocab after BPE merge
+        - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
+    
+    """
+
+    num_workers = 8
+
+    with open(input_path, "rb") as f:
+        special_tokens_bytes = list(s.encode() for s in special_tokens)
+        boundaries = find_chunk_boundaries(f, num_workers, "\u0003".encode());
+
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            process_chunk()
+        
+    raise NotImplementedError

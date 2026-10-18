@@ -8,8 +8,12 @@ from typing import BinaryIO
 
 class TokenizerTrainer():
 
+    # === Constants ====================================================================================
+
     PAT = PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     BASE_VOCAB_SIZE = 256
+
+    # === BPE Trainer Helper functions ==================================================================
 
     def find_chunk_boundaries(
         self,
@@ -100,45 +104,6 @@ class TokenizerTrainer():
 
         return list(int(byte) for byte in word.encode())
 
-
-    def encode():
-        """Remember: split the chunk by special char, where special char is its own element.
-        """
-        raise NotImplementedError
-
-    def get_freq(
-        self,
-        mapped_words: list[list[int]],
-    ) -> dict[tuple[int,int], int]:
-        """Get frequency count for each adjacent token pairs
-        """
-        freq = dict()
-
-        for word in mapped_words:
-            for pair in zip(word[:-1], word[1:]):
-                if pair not in freq:
-                    freq[pair] = 0
-                freq[pair] += 1
-        
-        return freq
-
-    def merge_pair(
-        self,
-        mapped_words: list[list[int]],
-        pair: tuple[int,int],
-        replace_id: int,
-    ) -> None:
-        """Modify mapped_words in-place, merging every occurences of pair
-        """
-        for idx in range(len(mapped_words)):
-            new_word = []
-            for x in mapped_words[idx]:
-                if len(new_word) and new_word[-1] == pair[0] and x == pair[1]:
-                    new_word[-1] = replace_id
-                    continue
-                new_word.append(x)
-            mapped_words[idx] = new_word
-
     def init_vocab(
         self,
     ) -> dict[int,bytes]:
@@ -175,6 +140,55 @@ class TokenizerTrainer():
         self.num_workers = 16
         self.special_tokens = special_tokens
         self.vocab_size = vocab_size
+
+    def advance_token_word(
+        self,
+        word: list[int],
+        pos: int,
+    ) -> int:
+        return pos + len(self.vocab[word[pos]]);
+
+    def advance_token_id(
+        self,
+        id: int,
+        pos: int,
+    ) -> int:
+        return pos + len(self.vocab[id]);
+
+    # === train_bpe_baseline specific ===================================================================
+
+    def get_freq(
+        self,
+        mapped_words: list[list[int]],
+    ) -> dict[tuple[int,int], int]:
+        """Get frequency count for each adjacent token pairs
+        """
+        freq = dict()
+
+        for word in mapped_words:
+            for pair in zip(word[:-1], word[1:]):
+                if pair not in freq:
+                    freq[pair] = 0
+                freq[pair] += 1
+        
+        return freq
+
+    def merge_pair(
+        self,
+        mapped_words: list[list[int]],
+        pair: tuple[int,int],
+        replace_id: int,
+    ) -> None:
+        """Modify mapped_words in-place, merging every occurences of pair
+        """
+        for idx in range(len(mapped_words)):
+            new_word = []
+            for x in mapped_words[idx]:
+                if len(new_word) and new_word[-1] == pair[0] and x == pair[1]:
+                    new_word[-1] = replace_id
+                    continue
+                new_word.append(x)
+            mapped_words[idx] = new_word
 
     def train_bpe_baseline(
         self,
@@ -230,6 +244,8 @@ class TokenizerTrainer():
 
         return vocab, merges
 
+    # === train_bpe specific ============================================================================
+
     def create_mapping(
         self,
         words: list[str]
@@ -241,20 +257,6 @@ class TokenizerTrainer():
             else:
                 res.append(self.map_word(word))
         return res
-
-    def advance_token_word(
-        self,
-        word: list[int],
-        pos: int,
-    ) -> int:
-        return pos + len(self.vocab[word[pos]]);
-
-    def advance_token_id(
-        self,
-        id: int,
-        pos: int,
-    ) -> int:
-        return pos + len(self.vocab[id]);
 
     def init_inverted_records(
         self,
@@ -383,6 +385,7 @@ class TokenizerTrainer():
             self.merge_record(mapping, freq, record, max_pair, key)
 
         return self.vocab, merges
+
 
 
 class Tokenizer():

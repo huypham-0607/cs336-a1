@@ -2,8 +2,8 @@ import os
 import multiprocessing
 import regex as re
 
-from queue import PriorityQueue
-from multiprocessing import Pool, Process
+from collections.abc import Iterable, Iterator
+from multiprocessing import Pool
 from typing import BinaryIO
 
 class TokenizerTrainer():
@@ -12,6 +12,7 @@ class TokenizerTrainer():
 
     PAT = PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     BASE_VOCAB_SIZE = 256
+    CHUNK_DELIMITER = "<|endoftext|>"
 
     # === BPE Trainer Helper functions ==================================================================
 
@@ -155,6 +156,13 @@ class TokenizerTrainer():
     ) -> int:
         return pos + len(self.vocab[id]);
 
+    def __init__(
+        self,
+        vocab_size: int,
+        special_tokens: list[str],
+    ) -> None:
+        self.init_attr(special_tokens, vocab_size)
+    
     # === train_bpe_baseline specific ===================================================================
 
     def get_freq(
@@ -193,8 +201,6 @@ class TokenizerTrainer():
     def train_bpe_baseline(
         self,
         input_path: str | os.PathLike,
-        vocab_size: int,
-        special_tokens: list[str]
     ) -> tuple[
         dict[int,bytes],
         list[tuple[bytes, bytes]],
@@ -212,11 +218,9 @@ class TokenizerTrainer():
         
         """
 
-        self.init_attr(special_tokens, vocab_size)
-
         # Getting chunk boundaries for parallelism
         with open(input_path, "rb") as f:
-            special_tokens_bytes = list(s.encode() for s in special_tokens)
+            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
             boundaries = self.find_chunk_boundaries(f, self.num_workers, "\u0003".encode());
 
         # Initializing vocab (all bytes & special tokens)
@@ -228,12 +232,12 @@ class TokenizerTrainer():
         mapped_words = [self.map_word(word) for word in words]
 
         # Start merging adjacent pairs
-        while (len(vocab) < vocab_size):
+        while (len(vocab) < self.vocab_size):
             freq = self.get_freq(mapped_words)
             try:
                 max_pair = max(freq, key=lambda k: (freq[k],(vocab[k[0]], vocab[k[1]])))
             except ValueError:
-                raise ValueError(f"Unable to create vocab of size {vocab_size}: Max size is {len(vocab)}")
+                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(vocab)}")
             key = len(vocab)
             value = vocab[max_pair[0]] + vocab[max_pair[1]]
             vocab[key] = value
@@ -334,8 +338,6 @@ class TokenizerTrainer():
     def train_bpe(
         self,
         input_path: str | os.PathLike,
-        vocab_size: int,
-        special_tokens: list[str]
     ) -> tuple[
         dict[int,bytes],
         list[tuple[bytes, bytes]],
@@ -353,12 +355,10 @@ class TokenizerTrainer():
         
         """
 
-        self.init_attr(special_tokens, vocab_size)
-
         # Getting chunk boundaries for parallelism
         with open(input_path, "rb") as f:
-            special_tokens_bytes = list(s.encode() for s in special_tokens)
-            boundaries = self.find_chunk_boundaries(f, self.num_workers, "\u0003".encode());
+            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
+            boundaries = self.find_chunk_boundaries(f, self.num_workers, self.CHUNK_DELIMITER.encode());
 
         # Initializing vocab (all bytes & special tokens)
         self.vocab = self.init_vocab()
@@ -371,11 +371,11 @@ class TokenizerTrainer():
         freq, record = self.init_inverted_records(mapping)
 
         # Start merging adjacent pairs
-        while (len(self.vocab) < vocab_size):
+        while (len(self.vocab) < self.vocab_size):
             try:
                 max_pair = max(freq, key=lambda k: (freq[k],(self.vocab[k[0]], self.vocab[k[1]])))
             except ValueError:
-                raise ValueError(f"Unable to create vocab of size {vocab_size}: Max size is {len(self.vocab)}")
+                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(self.vocab)}")
             key = len(self.vocab)
             value = self.vocab[max_pair[0]] + self.vocab[max_pair[1]]
             self.vocab[key] = value
@@ -387,10 +387,65 @@ class TokenizerTrainer():
         return self.vocab, merges
 
 
+def train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str]
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    trainer = TokenizerTrainer(vocab_size, special_tokens)
+    return trainer.train_bpe(input_path)
 
 class Tokenizer():
 
-    def encode():
+    @staticmethod
+    def dump_vocab(
+        vocab: dict[int, bytes],
+        vocab_filepath: str | os.PathLike,
+    ) -> None:
+        pass
+
+    @staticmethod
+    def dump_merges(
+        merges: list[tuple[bytes, bytes]],
+        merges_filepath: str | os.PathLike,
+    ) -> None:
+        pass
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None
+    ) -> None:
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None
+    ):
+        raise NotImplementedError
+  
+    def encode(
+        self,
+        text: str,
+    ) -> list[int]:
         """Remember: split the chunk by special char, where special char is its own element.
         """
+        raise NotImplementedError
+
+    def encode_iterable(
+        self,
+        iterable: Iterable[str]
+    ) -> Iterator[int]:
+        raise NotImplementedError
+
+    def decode(
+        self,
+        ids: list[int]
+    ) -> str:
         raise NotImplementedError

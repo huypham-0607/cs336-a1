@@ -591,5 +591,4 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     
-    trainer = tokenizer.TokenizerTrainer()
-    return trainer.train_bpe(input_path, vocab_size, special_tokens)
+    return tokenizer.train_bpe(input_path, vocab_size, special_tokens)

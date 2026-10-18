@@ -326,6 +326,9 @@ class TokenizerTrainer():
                 post = self.advance_token_word(mapping[i], l)
                 self.add_pair(mapping, freq, record, i, l, post)
 
+        freq.pop(pair, None)
+        record.pop(pair, None)
+
     def train_bpe(
         self,
         input_path: str | os.PathLike,

@@ -1,6 +1,7 @@
 import os
 import multiprocessing
 import regex as re
+import pickle
 
 from collections.abc import Iterable, Iterator
 from multiprocessing import Pool
@@ -402,14 +403,16 @@ class Tokenizer():
         vocab: dict[int, bytes],
         vocab_filepath: str | os.PathLike,
     ) -> None:
-        pass
+        with open(vocab_filepath, 'wb') as file:
+            pickle.dump(vocab, file, pickle.HIGHEST_PROTOCOL)
 
     @staticmethod
     def dump_merges(
         merges: list[tuple[bytes, bytes]],
         merges_filepath: str | os.PathLike,
     ) -> None:
-        pass
+        with open(merges_filepath, 'wb') as file:
+            pickle.dump(merges, file, pickle.HIGHEST_PROTOCOL)
 
     def __init__(
         self,

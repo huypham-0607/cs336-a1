@@ -584,7 +584,7 @@ class Tokenizer():
         # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
         return sorted(set(chunk_boundaries))
 
-    # === Static Helpers ====================================================================
+    # === Instantiation =================================================================================
 
     def __init__(
         self,
@@ -601,7 +601,8 @@ class Tokenizer():
             self.inv_vocab[merge[1]],
             self.inv_vocab[merge[0] + merge[1]]
         ) for merge in merges]
-        self.special_tokens = special_tokens if special_tokens != None else ['\n']
+        self.special_tokens = special_tokens if special_tokens != None else []
+        self.pretokenizer = Pretokenizer(self.special_tokens)
 
     @classmethod
     def from_files(
@@ -617,31 +618,181 @@ class Tokenizer():
 
         return cls(vocab, merges, special_tokens)
 
-    def 
-  
+    # === Token encoding private helpers =====================================================================
+
+    def _map_word(
+        self,        
+        word: str,
+    ) -> list[int]:
+        """Map each bytes in a word to its corresponding value in the vocab 
+        """
+
+        if word in self.special_tokens:
+            return self.inv_vocab[word.encode()]
+
+        return [self.inv_vocab[byte] for byte in word.encode()]
+
+    def _advance_token_word(
+        self,
+        word: list[int],
+        pos: int,
+    ) -> int:
+        return pos + len(self.vocab[word[pos]]);
+
+    def _advance_token_id(
+        self,
+        id: int,
+        pos: int,
+    ) -> int:
+        return pos + len(self.vocab[id]);
+
+    def _create_mapping(
+        self,
+        words: list[str]
+    ) -> list[list[int]]:
+        res = []
+        for word in words:
+            if word in self.special_tokens:
+                res.append([self.inv_vocab[word.encode()] for i in range(len(word))])
+            else:
+                res.append(self._map_word(word))
+        return res
+
+    def _init_inverted_records(
+        self,
+        mapping: list[list[int]]
+    ) -> dict[tuple[int,int], list[tuple[int,int]]]:
+        record = dict()
+
+        for i in range(len(mapping)):
+            word = mapping[i]
+            l = 0
+            r = self._advance_token_word(word, 0)
+            while r < len(word):
+                pair = (word[l], word[r])
+                if pair not in record:
+                    record[pair] = []
+                record[pair].append((i,l))
+
+                l = self._advance_token_word(word, l)
+                r = self._advance_token_word(word, r)
+        
+        return record
+
+    def _add_pair(
+        self,
+        mapping: list[list[int]],
+        record: dict[tuple[int,int], list[tuple[int,int]]],
+        i: int,
+        l: int,
+        r: int,
+    ):
+        n_pair = (mapping[i][l], mapping[i][r])
+        if n_pair not in record:
+            record[n_pair] = []
+        record[n_pair].append((i,l))
+
+    def _merge_record(
+        self,
+        mapping: list[list[int]],
+        record: dict[tuple[int,int], list[tuple[int,int]]],
+        pair: tuple[int,int],
+        key: int,
+    ) -> None:
+        for i, l in record[pair]:
+            r = self._advance_token_id(pair[0], l)
+            if mapping[i][l] != pair[0] or mapping[i][r] != pair[1]:
+                continue
+
+            for idx in range(l, self._advance_token_word(mapping[i], r)):
+                mapping[i][idx] = key
+
+            if (l!=0):
+                prev = l - len(self.vocab[mapping[i][l-1]])
+                self._add_pair(mapping, record, i, prev, l)
+
+            if self._advance_token_word(mapping[i], l) != len(mapping[i]):
+                post = self._advance_token_word(mapping[i], l)
+                self._add_pair(mapping, record, i, l, post)
+
+        record.pop(pair, None)
+
+    def _compress_mapping(
+        self,
+        mapping: list[list[int]],
+    ) -> list[list[int]]:
+        res = []
+        for word in mapping:
+            res.append([])
+            ptr = 0
+            while ptr < len(word):
+                res[-1].append(word[ptr])
+                ptr = self._advance_token_word(word, ptr)
+        return res
+
     def encode(
         self,
         text: str,
-        pretokenizer: Pretokenizer | None = None,
     ) -> list[int]:
         """Remember: split the chunk by special char, where special char is its own element.
         """
 
-        if (pretokenizer == None):
-            pretokenizer = Pretokenizer(self.special_tokens)
+        words = self.pretokenizer.pretokenize(text)
+        mapping = self._create_mapping(words)
+        records = self._init_inverted_records(mapping)
+        
+        for l, r, key in self.merges:
+            pair = (l,r)
+            self._merge_record(mapping, records, pair, key)
 
-        words = pretokenizer.pretokenize(text)
+        compressed = self._compress_mapping(mapping)
+        return [key for word in compressed for key in word]
 
-    @staticmethod
-    def fetch_token(
-        iterable: Iterable[str]
-    )
+    class TokenIterator():
+        def _advance_str(
+            self,
+        ):
+            self.ptr = 0
+            try:
+                nxt_string = next(self.iterable)
+            except StopIteration:
+                self.encoded = None
+                return
+            self.encoded = self.tokenizer.encode(nxt_string)
+
+        def __init__(
+            self,
+            iterable: Iterable[str],
+            tokenizer: "Tokenizer",
+        ):
+            self.iterable = iter(iterable)
+            self.tokenizer = tokenizer
+            self.ptr = 0
+            self.encoded = []
+            while self.encoded != None and self.ptr == len(self.encoded):
+                self._advance_str()
+
+        def __next__(
+            self,
+        ):
+            while self.encoded != None and self.ptr == len(self.encoded):
+                self._advance_str()
+            if self.encoded == None:
+                raise StopIteration
+            key = self.encoded[self.ptr]
+            self.ptr += 1
+            return key
+            
+        def __iter__(
+            self,
+        ):
+            return self
 
     def encode_iterable(
         self,
         iterable: Iterable[str]
     ) -> Iterator[int]:
-        
+        return Tokenizer.TokenIterator(iterable, self)
 
     def decode(
         self,

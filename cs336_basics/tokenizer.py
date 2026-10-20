@@ -1,11 +1,140 @@
 import os
+import io
 import multiprocessing
 import regex as re
 import pickle
 
+from pathlib import Path
 from collections.abc import Iterable, Iterator
 from multiprocessing import Pool
 from typing import BinaryIO
+
+# Helpers
+
+class Pretokenizer():
+
+    # === Constants ==================================================================================
+
+    CHUNK_DELIMITER = "<|endoftext|>"
+
+    # === Helpers ==================================================================================
+
+    @staticmethod
+    def _open(input_path: str | os.PathLike) -> BinaryIO:
+        return open(input_path, "rb") if isinstance(input_path, os.PathLike) else io.BytesIO(input_path.encode())
+
+    # === Instance methods ==================================================================================
+
+    def __init__(
+        self,
+        special_tokens: list[str],
+        num_workers = 8,
+    ):
+        self.num_workers = num_workers
+        self.special_tokens = special_tokens
+
+    def find_chunk_boundaries(
+        self,
+        file: BinaryIO,
+        desired_num_chunks: int,
+        split_special_token: bytes,
+    ) -> list[int]:
+        """
+        Chunk the file into parts that can be counted independently.
+        May return fewer chunks if the boundaries end up overlapping.
+        """
+        assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+        # Get total file size in bytes
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+
+        chunk_size = file_size // desired_num_chunks
+
+        # Initial guesses for chunk boundary locations, uniformly spaced
+        # Chunks start on previous index, don't include last index
+        chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        chunk_boundaries[-1] = file_size
+
+        mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+        for bi in range(1, len(chunk_boundaries) - 1):
+            initial_position = chunk_boundaries[bi]
+            file.seek(initial_position)  # Start at boundary guess
+            while True:
+                mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+                # If EOF, this boundary should be at the end of the file
+                if mini_chunk == b"":
+                    chunk_boundaries[bi] = file_size
+                    break
+
+                # Find the special token in the mini chunk
+                found_at = mini_chunk.find(split_special_token)
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
+
+        # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+        return sorted(set(chunk_boundaries))
+
+    def pretokenize_chunk(
+        self,
+        file_path: str | os.PathLike,
+        start: int,
+        end: int,
+        keep_special: bool = True,
+    ) -> list[str]:
+        """Process a chunk of data in file, outlined by [start, end)
+
+        This function either strips all special tokens, or keep them as a monolithic element
+
+        """
+        # Splitting on special character
+        with self._open(file_path) as file:
+            if keep_special:
+                split_pat = re.compile("(" + "|".join(re.escape(special_token) for special_token in self.special_tokens) + ")")
+            else:
+                split_pat = re.compile("|".join(re.escape(special_token) for special_token in self.special_tokens))
+
+            file.seek(start, os.SEEK_SET)
+            corpus = file.read(end-start).decode('utf-8', errors='ignore')
+            words = list(re.split(split_pat, corpus))
+
+            # Pretokenization
+            tokens = []
+            for word in words:
+                tokens += (word if word in self.special_tokens else re.findall(TokenizerTrainer.PAT, word))
+
+        return tokens
+
+    def pretokenize(
+        self,
+        input_path: str | os.PathLike,
+        is_path = True,
+    ) -> list[str]:
+        # Setup for multithreading
+        words = []
+        args = []
+
+        if (is_path):
+            input_path = Path(input_path)
+
+        with self._open(input_path) as f:
+            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
+            boundaries = self.find_chunk_boundaries(f, self.num_workers, self.CHUNK_DELIMITER.encode());
+
+
+        for i in range(len(boundaries)-1):
+            args.append((input_path ,boundaries[i], boundaries[i+1], False))
+
+        with Pool(processes=len(boundaries)) as pool:
+            words = pool.starmap(self.pretokenize_chunk, args)
+
+        words = [word for single_words in words for word in single_words]
+        return words
 
 class TokenizerTrainer():
 
@@ -218,18 +347,13 @@ class TokenizerTrainer():
             - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
         
         """
-
-        # Getting chunk boundaries for parallelism
-        with open(input_path, "rb") as f:
-            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
-            boundaries = self.find_chunk_boundaries(f, self.num_workers, "\u0003".encode());
-
         # Initializing vocab (all bytes & special tokens)
         vocab = self.init_vocab()
         merges = []
 
         # Pretokenize corpus
-        words = self.pretokenize(input_path, boundaries)
+        pretokenizer = Pretokenizer(self.special_tokens)
+        words = pretokenizer.pretokenize(input_path)
         mapped_words = [self.map_word(word) for word in words]
 
         # Start merging adjacent pairs
@@ -356,17 +480,13 @@ class TokenizerTrainer():
         
         """
 
-        # Getting chunk boundaries for parallelism
-        with open(input_path, "rb") as f:
-            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
-            boundaries = self.find_chunk_boundaries(f, self.num_workers, self.CHUNK_DELIMITER.encode());
-
         # Initializing vocab (all bytes & special tokens)
         self.vocab = self.init_vocab()
         merges = []
 
         # Pretokenize corpus
-        words = self.pretokenize(input_path, boundaries)
+        pretokenizer = Pretokenizer(self.special_tokens)
+        words = pretokenizer.pretokenize(input_path)
 
         mapping = self.create_mapping(words)
         freq, record = self.init_inverted_records(mapping)
@@ -387,16 +507,19 @@ class TokenizerTrainer():
 
         return self.vocab, merges
 
-
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """API Wrapper for train_bpe
+    """
     trainer = TokenizerTrainer(vocab_size, special_tokens)
     return trainer.train_bpe(input_path)
 
 class Tokenizer():
+
+    # === Static Helpers ====================================================================
 
     @staticmethod
     def dump_vocab(
@@ -414,6 +537,55 @@ class Tokenizer():
         with open(merges_filepath, 'wb') as file:
             pickle.dump(merges, file, pickle.HIGHEST_PROTOCOL)
 
+    @staticmethod
+    def find_chunk_boundaries(
+        file: BinaryIO,
+        desired_chunk_size: int,
+        split_special_token: bytes,
+    ) -> list[int]:
+        """
+        Chunk the file into parts that can be counted independently.
+        May return fewer chunks if the boundaries end up overlapping.
+        """
+        assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+        # Get total file size in bytes
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+
+        num_chunks = file_size // desired_chunk_size
+
+        # Initial guesses for chunk boundary locations, uniformly spaced
+        # Chunks start on previous index, don't include last index
+        chunk_boundaries = [i * desired_chunk_size for i in range(num_chunks + 1)]
+        chunk_boundaries[-1] = file_size
+
+        mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+        for bi in range(1, len(chunk_boundaries) - 1):
+            initial_position = chunk_boundaries[bi]
+            file.seek(initial_position)  # Start at boundary guess
+            while True:
+                mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+                # If EOF, this boundary should be at the end of the file
+                if mini_chunk == b"":
+                    chunk_boundaries[bi] = file_size
+                    break
+
+                # Find the special token in the mini chunk
+                found_at = mini_chunk.find(split_special_token)
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
+
+        # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+        return sorted(set(chunk_boundaries))
+
+    # === Static Helpers ====================================================================
+
     def __init__(
         self,
         vocab: dict[int, bytes],
@@ -421,8 +593,15 @@ class Tokenizer():
         special_tokens: list[str] | None = None
     ) -> None:
         self.vocab = vocab
-        self.merges = merges
-        self.special_tokens = special_tokens
+        self.inv_vocab = {}
+        for key in vocab:
+            self.inv_vocab[vocab[key]] = key
+        self.merges = [(
+            self.inv_vocab[merge[0]],
+            self.inv_vocab[merge[1]],
+            self.inv_vocab[merge[0] + merge[1]]
+        ) for merge in merges]
+        self.special_tokens = special_tokens if special_tokens != None else ['\n']
 
     @classmethod
     def from_files(
@@ -431,21 +610,38 @@ class Tokenizer():
         merges_filepath: str,
         special_tokens: list[str] | None = None
     ):
-        raise NotImplementedError
+        with open(vocab_filepath, 'rb') as file:
+            vocab = pickle.load(file)
+        with open(merges_filepath, 'rb') as file:
+            merges = pickle.load(file)
+
+        return cls(vocab, merges, special_tokens)
+
+    def 
   
     def encode(
         self,
         text: str,
+        pretokenizer: Pretokenizer | None = None,
     ) -> list[int]:
         """Remember: split the chunk by special char, where special char is its own element.
         """
-        raise NotImplementedError
+
+        if (pretokenizer == None):
+            pretokenizer = Pretokenizer(self.special_tokens)
+
+        words = pretokenizer.pretokenize(text)
+
+    @staticmethod
+    def fetch_token(
+        iterable: Iterable[str]
+    )
 
     def encode_iterable(
         self,
         iterable: Iterable[str]
     ) -> Iterator[int]:
-        raise NotImplementedError
+        
 
     def decode(
         self,

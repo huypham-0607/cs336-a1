@@ -730,23 +730,9 @@ class Tokenizer():
                 ptr = self._advance_token_word(word, ptr)
         return res
 
-    def encode(
-        self,
-        text: str,
-    ) -> list[int]:
-        """Remember: split the chunk by special char, where special char is its own element.
-        """
 
-        words = self.pretokenizer.pretokenize(text)
-        mapping = self._create_mapping(words)
-        records = self._init_inverted_records(mapping)
-        
-        for l, r, key in self.merges:
-            pair = (l,r)
-            self._merge_record(mapping, records, pair, key)
-
-        compressed = self._compress_mapping(mapping)
-        return [key for word in compressed for key in word]
+    
+    # === Token iterator class ===============================================================================
 
     class TokenIterator():
         def _advance_str(
@@ -788,6 +774,26 @@ class Tokenizer():
         ):
             return self
 
+    # === Front facing APIs ======================================================================================
+
+    def encode(
+        self,
+        text: str,
+    ) -> list[int]:
+        """Remember: split the chunk by special char, where special char is its own element.
+        """
+
+        words = self.pretokenizer.pretokenize(text)
+        mapping = self._create_mapping(words)
+        records = self._init_inverted_records(mapping)
+        
+        for l, r, key in self.merges:
+            pair = (l,r)
+            self._merge_record(mapping, records, pair, key)
+
+        compressed = self._compress_mapping(mapping)
+        return [key for word in compressed for key in word]
+
     def encode_iterable(
         self,
         iterable: Iterable[str]
@@ -798,4 +804,7 @@ class Tokenizer():
         self,
         ids: list[int]
     ) -> str:
-        raise NotImplementedError
+        res = bytearray()
+        for id in ids:
+            res.extend(self.vocab[id])
+        return bytes(res).decode(encoding='utf-8', errors='replace')

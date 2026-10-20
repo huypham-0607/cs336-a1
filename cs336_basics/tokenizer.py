@@ -146,83 +146,6 @@ class TokenizerTrainer():
 
     # === BPE Trainer Helper functions ==================================================================
 
-    def find_chunk_boundaries(
-        self,
-        file: BinaryIO,
-        desired_num_chunks: int,
-        split_special_token: bytes,
-    ) -> list[int]:
-        """
-        Chunk the file into parts that can be counted independently.
-        May return fewer chunks if the boundaries end up overlapping.
-        """
-        assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
-
-        # Get total file size in bytes
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
-
-        chunk_size = file_size // desired_num_chunks
-
-        # Initial guesses for chunk boundary locations, uniformly spaced
-        # Chunks start on previous index, don't include last index
-        chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
-        chunk_boundaries[-1] = file_size
-
-        mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
-
-        for bi in range(1, len(chunk_boundaries) - 1):
-            initial_position = chunk_boundaries[bi]
-            file.seek(initial_position)  # Start at boundary guess
-            while True:
-                mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
-
-                # If EOF, this boundary should be at the end of the file
-                if mini_chunk == b"":
-                    chunk_boundaries[bi] = file_size
-                    break
-
-                # Find the special token in the mini chunk
-                found_at = mini_chunk.find(split_special_token)
-                if found_at != -1:
-                    chunk_boundaries[bi] = initial_position + found_at
-                    break
-                initial_position += mini_chunk_size
-
-        # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
-        return sorted(set(chunk_boundaries))
-
-    def pretokenize_chunk(
-        self,
-        file_path: str,
-        start: int,
-        end: int,
-        keep_special: bool = True,
-    ) -> list[str]:
-        """Process a chunk of data in file, outlined by [start, end)
-
-        This function either strips all special tokens, or keep them as a monolithic element
-
-        """
-        # Splitting on special character
-        with open(file_path, "rb") as file:
-            if keep_special:
-                split_pat = re.compile("(" + "|".join(re.escape(special_token) for special_token in self.special_tokens) + ")")
-            else:
-                split_pat = re.compile("|".join(re.escape(special_token) for special_token in self.special_tokens))
-
-            file.seek(start, os.SEEK_SET)
-            corpus = file.read(end-start).decode('utf-8', errors='ignore')
-            words = list(re.split(split_pat, corpus))
-
-            # Pretokenization
-            tokens = []
-            for word in words:
-                tokens += (word if word in self.special_tokens else re.findall(TokenizerTrainer.PAT, word))
-
-        return tokens
-
     def map_word(
         self,        
         word: str,
@@ -243,25 +166,6 @@ class TokenizerTrainer():
             vocab[TokenizerTrainer.BASE_VOCAB_SIZE + i] = self.special_tokens[i].encode()
 
         return vocab
-
-    def pretokenize(
-        self,
-        input_path: str | os.PathLike,
-        boundaries: list[int],
-    ) -> list[str]:
-        # Setup for multithreading
-        merges = []
-        words = []
-        args = []
-
-        for i in range(len(boundaries)-1):
-            args.append((input_path ,boundaries[i], boundaries[i+1], False))
-
-        with Pool(processes=len(boundaries)) as pool:
-            words = pool.starmap(self.pretokenize_chunk, args)
-
-        words = [word for single_words in words for word in single_words]
-        return words
 
     def init_attr(
         self,
@@ -596,12 +500,21 @@ class Tokenizer():
         self.inv_vocab = {}
         for key in vocab:
             self.inv_vocab[vocab[key]] = key
+
+        self.special_tokens = special_tokens if special_tokens != None else []
+        for special_token in self.special_tokens:
+            encoded_token = special_token.encode()
+            if encoded_token not in self.inv_vocab:
+                key = len(vocab)
+                self.vocab[key] = encoded_token
+                self.inv_vocab[encoded_token] = key
+
         self.merges = [(
             self.inv_vocab[merge[0]],
             self.inv_vocab[merge[1]],
             self.inv_vocab[merge[0] + merge[1]]
         ) for merge in merges]
-        self.special_tokens = special_tokens if special_tokens != None else []
+
         self.pretokenizer = Pretokenizer(self.special_tokens)
 
     @classmethod
@@ -628,9 +541,9 @@ class Tokenizer():
         """
 
         if word in self.special_tokens:
-            return self.inv_vocab[word.encode()]
+            return [self.inv_vocab[word.encode()]]
 
-        return [self.inv_vocab[byte] for byte in word.encode()]
+        return [self.inv_vocab[byte.to_bytes()] for byte in word.encode()]
 
     def _advance_token_word(
         self,
@@ -729,8 +642,6 @@ class Tokenizer():
                 res[-1].append(word[ptr])
                 ptr = self._advance_token_word(word, ptr)
         return res
-
-
     
     # === Token iterator class ===============================================================================
 
@@ -783,13 +694,14 @@ class Tokenizer():
         """Remember: split the chunk by special char, where special char is its own element.
         """
 
-        words = self.pretokenizer.pretokenize(text)
+        words = self.pretokenizer.pretokenize(text, False)
         mapping = self._create_mapping(words)
         records = self._init_inverted_records(mapping)
         
         for l, r, key in self.merges:
             pair = (l,r)
-            self._merge_record(mapping, records, pair, key)
+            if pair in records:
+                self._merge_record(mapping, records, pair, key)
 
         compressed = self._compress_mapping(mapping)
         return [key for word in compressed for key in word]

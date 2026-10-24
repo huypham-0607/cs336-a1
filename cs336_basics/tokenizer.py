@@ -4,6 +4,7 @@ import multiprocessing
 import regex as re
 import pickle
 
+from queue import PriorityQueue
 from pathlib import Path
 from collections.abc import Iterable, Iterator
 from multiprocessing import Pool
@@ -31,6 +32,7 @@ class Pretokenizer():
         num_workers = 8,
     ):
         self.num_workers = num_workers
+        special_tokens.sort(key = lambda x : len(x), reverse=True)
         self.special_tokens = special_tokens
 
     def find_chunk_boundaries(
@@ -95,26 +97,37 @@ class Pretokenizer():
         # Splitting on special character
         with self._open(file_path) as file:
             if keep_special:
-                split_pat = re.compile("(" + "|".join(re.escape(special_token) for special_token in self.special_tokens) + ")")
+                split_pat = re.compile(
+                    "(" + "|".join(re.escape(special_token) for special_token in self.special_tokens) + ")"
+                )
             else:
-                split_pat = re.compile("|".join(re.escape(special_token) for special_token in self.special_tokens))
+                split_pat = re.compile(
+                    "|".join(re.escape(special_token) for special_token in self.special_tokens)
+                )
 
             file.seek(start, os.SEEK_SET)
             corpus = file.read(end-start).decode('utf-8', errors='ignore')
-            words = list(re.split(split_pat, corpus))
+            words = (list(re.split(split_pat, corpus)) if len(self.special_tokens) else [corpus])
 
             # Pretokenization
             tokens = []
             for word in words:
-                tokens += (word if word in self.special_tokens else re.findall(TokenizerTrainer.PAT, word))
+                if word in self.special_tokens:
+                    tokens.append(word)
+                else:
+                    tokens += re.findall(TokenizerTrainer.PAT, word)
 
         return tokens
 
     def pretokenize(
         self,
         input_path: str | os.PathLike,
+        num_workers = 0,
         is_path = True,
+        keep_special = False,
     ) -> list[str]:
+        if num_workers == 0:
+            num_workers = self.num_workers
         # Setup for multithreading
         words = []
         args = []
@@ -124,11 +137,11 @@ class Pretokenizer():
 
         with self._open(input_path) as f:
             special_tokens_bytes = list(s.encode() for s in self.special_tokens)
-            boundaries = self.find_chunk_boundaries(f, self.num_workers, self.CHUNK_DELIMITER.encode());
+            boundaries = self.find_chunk_boundaries(f, num_workers, self.CHUNK_DELIMITER.encode());
 
 
         for i in range(len(boundaries)-1):
-            args.append((input_path ,boundaries[i], boundaries[i+1], False))
+            args.append((input_path ,boundaries[i], boundaries[i+1], keep_special))
 
         with Pool(processes=len(boundaries)) as pool:
             words = pool.starmap(self.pretokenize_chunk, args)
@@ -286,7 +299,7 @@ class TokenizerTrainer():
         res = []
         for word in words:
             if word in self.special_tokens:
-                res.append([TokenizerTrainer.BASE_VOCAB_SIZE + self.special_tokens.index(word) for i in range(len(word))])
+                res.append([TokenizerTrainer.BASE_VOCAB_SIZE + self.special_tokens.index(word) for i in range(len(word.encode()))])
             else:
                 res.append(self.map_word(word))
         return res
@@ -509,11 +522,10 @@ class Tokenizer():
                 self.vocab[key] = encoded_token
                 self.inv_vocab[encoded_token] = key
 
-        self.merges = [(
-            self.inv_vocab[merge[0]],
-            self.inv_vocab[merge[1]],
-            self.inv_vocab[merge[0] + merge[1]]
-        ) for merge in merges]
+        self.merges = {
+            (self.inv_vocab[merges[i][0]], self.inv_vocab[merges[i][1]]):
+            (i, self.inv_vocab[merges[i][0] + merges[i][1]])
+        for i in range(len(merges))}
 
         self.pretokenizer = Pretokenizer(self.special_tokens)
 
@@ -566,7 +578,7 @@ class Tokenizer():
         res = []
         for word in words:
             if word in self.special_tokens:
-                res.append([self.inv_vocab[word.encode()] for i in range(len(word))])
+                res.append([self.inv_vocab[word.encode()] for i in range(len(word.encode()))])
             else:
                 res.append(self._map_word(word))
         return res
@@ -574,8 +586,9 @@ class Tokenizer():
     def _init_inverted_records(
         self,
         mapping: list[list[int]]
-    ) -> dict[tuple[int,int], list[tuple[int,int]]]:
+    ) -> tuple[dict[tuple[int,int], list[tuple[int,int]]], PriorityQueue]:
         record = dict()
+        heap = PriorityQueue()
 
         for i in range(len(mapping)):
             word = mapping[i]
@@ -583,32 +596,40 @@ class Tokenizer():
             r = self._advance_token_word(word, 0)
             while r < len(word):
                 pair = (word[l], word[r])
-                if pair not in record:
-                    record[pair] = []
-                record[pair].append((i,l))
+
+                if pair in self.merges:
+                    if pair not in record:
+                        record[pair] = []
+                    record[pair].append((i,l))
+                    heap.put((self.merges[pair][0], pair))
 
                 l = self._advance_token_word(word, l)
                 r = self._advance_token_word(word, r)
         
-        return record
+        return record, heap
 
     def _add_pair(
         self,
         mapping: list[list[int]],
         record: dict[tuple[int,int], list[tuple[int,int]]],
+        heap: PriorityQueue,
         i: int,
         l: int,
         r: int,
     ):
         n_pair = (mapping[i][l], mapping[i][r])
-        if n_pair not in record:
-            record[n_pair] = []
-        record[n_pair].append((i,l))
+
+        if n_pair in self.merges:
+            if n_pair not in record:
+                record[n_pair] = []
+            record[n_pair].append((i,l))
+            heap.put((self.merges[n_pair][0], n_pair))
 
     def _merge_record(
         self,
         mapping: list[list[int]],
         record: dict[tuple[int,int], list[tuple[int,int]]],
+        heap: PriorityQueue,
         pair: tuple[int,int],
         key: int,
     ) -> None:
@@ -622,11 +643,11 @@ class Tokenizer():
 
             if (l!=0):
                 prev = l - len(self.vocab[mapping[i][l-1]])
-                self._add_pair(mapping, record, i, prev, l)
+                self._add_pair(mapping, record, heap, i, prev, l)
 
             if self._advance_token_word(mapping[i], l) != len(mapping[i]):
                 post = self._advance_token_word(mapping[i], l)
-                self._add_pair(mapping, record, i, l, post)
+                self._add_pair(mapping, record, heap, i, l, post)
 
         record.pop(pair, None)
 
@@ -694,14 +715,15 @@ class Tokenizer():
         """Remember: split the chunk by special char, where special char is its own element.
         """
 
-        words = self.pretokenizer.pretokenize(text, False)
+        words = self.pretokenizer.pretokenize(text, 1, False, True)
         mapping = self._create_mapping(words)
-        records = self._init_inverted_records(mapping)
+        records, heap = self._init_inverted_records(mapping)
         
-        for l, r, key in self.merges:
-            pair = (l,r)
-            if pair in records:
-                self._merge_record(mapping, records, pair, key)
+        while not heap.empty():
+            _, pair = heap.get()
+            if pair in self.merges and pair in records:
+                key = self.merges[pair][1]
+                self._merge_record(mapping, records, heap, pair, key)
 
         compressed = self._compress_mapping(mapping)
         return [key for word in compressed for key in word]

@@ -8,9 +8,3 @@ def test_run():
 
     print(vocab)
     print(merges)
-
-def test_find_chunk_boundaries():
-    trainer = tokenizer.TokenizerTrainer(261, ["<|endoftext|>"])
-    with open(TEXT_FILE, 'rb') as file:
-        boundaries = trainer.find_chunk_boundaries(file, 4, "<|endoftext|>".encode())
-        print(boundaries)

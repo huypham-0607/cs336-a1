@@ -13,6 +13,70 @@ from typing import BinaryIO
 # Helpers
 
 class Pretokenizer():
+    """Class used for pretokenizing corpus.
+
+    Attributes:
+        special_tokens: List of special tokens (tokens to keep the same for certain purposes)
+        num_workers: No of default worker threads during pretokenization stage. 
+    """
+
+    # === Front-facing APIs =======================================================================
+
+    def __init__(
+        self,
+        special_tokens: list[str],
+        num_workers = 8,
+    ):
+        """Initialize the pretokenizer.
+
+        Args:
+            special_tokens: List of special tokens.
+            num_workers: No of worker threads to default to for pretokenizer()
+        """
+        self.num_workers = num_workers
+        special_tokens.sort(key = lambda x : len(x), reverse=True)
+        self.special_tokens = special_tokens
+
+    def pretokenize(
+        self,
+        input_path: str | os.PathLike,
+        num_workers = 0,
+        is_path = True,
+        keep_special = False,
+    ) -> list[str]:
+        """Pretokenize the given corpus, return a list of pretokens.
+
+        Args:
+            input_path: Either a string or a Path to corpus.
+            num_workers: No of worker threads, default to self.num_workers. 1: will not spawn threads
+            is_path: If true, treat input_path as path to corpus, otherwise, treat input_path as corpus.
+            keep_special: Whether to keep all special tokens delimiter or truncate. Useful for training purpose.
+
+        Return:
+            list of string of pretokens.
+        """
+        if num_workers == 0:
+            num_workers = self.num_workers
+        # Setup for multithreading
+        words = []
+        args = []
+
+        if (is_path):
+            input_path = Path(input_path)
+
+        with self._open(input_path) as f:
+            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
+            boundaries = self._find_chunk_boundaries(f, num_workers, self.CHUNK_DELIMITER.encode());
+
+
+        for i in range(len(boundaries)-1):
+            args.append((input_path ,boundaries[i], boundaries[i+1], keep_special))
+
+        with Pool(processes=len(boundaries)) as pool:
+            words = pool.starmap(self._pretokenize_chunk, args)
+
+        words = [word for single_words in words for word in single_words]
+        return words
 
     # === Constants ==================================================================================
 
@@ -24,18 +88,7 @@ class Pretokenizer():
     def _open(input_path: str | os.PathLike) -> BinaryIO:
         return open(input_path, "rb") if isinstance(input_path, os.PathLike) else io.BytesIO(input_path.encode())
 
-    # === Instance methods ==================================================================================
-
-    def __init__(
-        self,
-        special_tokens: list[str],
-        num_workers = 8,
-    ):
-        self.num_workers = num_workers
-        special_tokens.sort(key = lambda x : len(x), reverse=True)
-        self.special_tokens = special_tokens
-
-    def find_chunk_boundaries(
+    def _find_chunk_boundaries(
         self,
         file: BinaryIO,
         desired_num_chunks: int,
@@ -82,7 +135,7 @@ class Pretokenizer():
         # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
         return sorted(set(chunk_boundaries))
 
-    def pretokenize_chunk(
+    def _pretokenize_chunk(
         self,
         file_path: str | os.PathLike,
         start: int,
@@ -119,37 +172,17 @@ class Pretokenizer():
 
         return tokens
 
-    def pretokenize(
-        self,
-        input_path: str | os.PathLike,
-        num_workers = 0,
-        is_path = True,
-        keep_special = False,
-    ) -> list[str]:
-        if num_workers == 0:
-            num_workers = self.num_workers
-        # Setup for multithreading
-        words = []
-        args = []
-
-        if (is_path):
-            input_path = Path(input_path)
-
-        with self._open(input_path) as f:
-            special_tokens_bytes = list(s.encode() for s in self.special_tokens)
-            boundaries = self.find_chunk_boundaries(f, num_workers, self.CHUNK_DELIMITER.encode());
-
-
-        for i in range(len(boundaries)-1):
-            args.append((input_path ,boundaries[i], boundaries[i+1], keep_special))
-
-        with Pool(processes=len(boundaries)) as pool:
-            words = pool.starmap(self.pretokenize_chunk, args)
-
-        words = [word for single_words in words for word in single_words]
-        return words
-
 class TokenizerTrainer():
+    """Train a tokenizer based on some corpus
+
+    This classes uses BPE tokenizer.
+
+    Attributes:
+        - special_tokens : List of special tokens
+        - vocab_size : Targetted output vocab size
+        - num_workers : No of workers to use for pretokenization, hardcoded 16
+
+    """
 
     # === Constants ====================================================================================
 
@@ -157,9 +190,120 @@ class TokenizerTrainer():
     BASE_VOCAB_SIZE = 256
     CHUNK_DELIMITER = "<|endoftext|>"
 
-    # === BPE Trainer Helper functions ==================================================================
+    # === Front facing APIs ==========================================================================
 
-    def map_word(
+    def __init__(
+        self,
+        vocab_size: int,
+        special_tokens: list[str],
+    ) -> None:
+        """Initialize the Tokenizer Trainer
+
+        Args:
+            - special_tokens : List of special tokens
+            - vocab_size : Targetted output vocab size
+        """
+        self._init_attr(special_tokens, vocab_size)
+
+    def train_bpe_baseline(
+        self,
+        input_path: str | os.PathLike,
+    ) -> tuple[
+        dict[int,bytes],
+        list[tuple[bytes, bytes]],
+    ]:
+        """Train Byte-pair Encoder, given corpus path & targeted vocab_size
+
+        Inefficient implementation. Serves as a baseline for the more efficient impl.
+
+        Args:
+            - input_path : Path to corpus
+            - vocab_size : Targetted output vocab size
+            - special_tokens : List of special tokens
+
+        Returns:
+            - vocab: dict[int, bytes] : The resulting vocab after BPE merge
+            - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
+        
+        """
+        # Initializing vocab (all bytes & special tokens)
+        vocab = self._init_vocab()
+        merges = []
+
+        # Pretokenize corpus
+        pretokenizer = Pretokenizer(self.special_tokens)
+        words = pretokenizer.pretokenize(input_path)
+        mapped_words = [self._map_word(word) for word in words]
+
+        # Start merging adjacent pairs
+        while (len(vocab) < self.vocab_size):
+            freq = self._get_freq(mapped_words)
+            try:
+                max_pair = max(freq, key=lambda k: (freq[k],(vocab[k[0]], vocab[k[1]])))
+            except ValueError:
+                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(vocab)}")
+            key = len(vocab)
+            value = vocab[max_pair[0]] + vocab[max_pair[1]]
+            vocab[key] = value
+
+            merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
+
+            self._merge_pair(mapped_words, max_pair, key)
+
+        return vocab, merges
+
+    def train_bpe(
+        self,
+        input_path: str | os.PathLike,
+    ) -> tuple[
+        dict[int,bytes],
+        list[tuple[bytes, bytes]],
+    ]:
+        """Train Byte-pair Encoder, given corpus path & targeted vocab_size
+
+        Efficient implementation. Use this one for most cases.
+        
+        Args:
+            - input_path : Path to corpus
+            - vocab_size : Targetted output vocab size
+            - special_tokens : List of special tokens
+
+        Returns:
+            - vocab: dict[int, bytes] : The resulting vocab after BPE merge
+            - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
+        
+        """
+
+        # Initializing vocab (all bytes & special tokens)
+        self.vocab = self._init_vocab()
+        merges = []
+
+        # Pretokenize corpus
+        pretokenizer = Pretokenizer(self.special_tokens)
+        words = pretokenizer.pretokenize(input_path)
+
+        mapping = self._create_mapping(words)
+        freq, record = self._init_inverted_records(mapping)
+
+        # Start merging adjacent pairs
+        while (len(self.vocab) < self.vocab_size):
+            try:
+                max_pair = max(freq, key=lambda k: (freq[k],(self.vocab[k[0]], self.vocab[k[1]])))
+            except ValueError:
+                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(self.vocab)}")
+            key = len(self.vocab)
+            value = self.vocab[max_pair[0]] + self.vocab[max_pair[1]]
+            self.vocab[key] = value
+
+            merges.append((self.vocab[max_pair[0]], self.vocab[max_pair[1]]))
+
+            self._merge_record(mapping, freq, record, max_pair, key)
+
+        return self.vocab, merges
+
+    # === General helper functions ==================================================================
+
+    def _map_word(
         self,        
         word: str,
     ) -> list[int]:
@@ -171,7 +315,7 @@ class TokenizerTrainer():
 
         return list(int(byte) for byte in word.encode())
 
-    def init_vocab(
+    def _init_vocab(
         self,
     ) -> dict[int,bytes]:
         vocab = dict((i,i.to_bytes()) for i in range(TokenizerTrainer.BASE_VOCAB_SIZE))
@@ -180,7 +324,7 @@ class TokenizerTrainer():
 
         return vocab
 
-    def init_attr(
+    def _init_attr(
         self,
         special_tokens: list[str],
         vocab_size: int,
@@ -189,30 +333,23 @@ class TokenizerTrainer():
         self.special_tokens = special_tokens
         self.vocab_size = vocab_size
 
-    def advance_token_word(
+    def _advance_token_word(
         self,
         word: list[int],
         pos: int,
     ) -> int:
         return pos + len(self.vocab[word[pos]]);
 
-    def advance_token_id(
+    def _advance_token_id(
         self,
         id: int,
         pos: int,
     ) -> int:
         return pos + len(self.vocab[id]);
-
-    def __init__(
-        self,
-        vocab_size: int,
-        special_tokens: list[str],
-    ) -> None:
-        self.init_attr(special_tokens, vocab_size)
     
-    # === train_bpe_baseline specific ===================================================================
+    # === train_bpe_baseline specific helpers ===========================================================
 
-    def get_freq(
+    def _get_freq(
         self,
         mapped_words: list[list[int]],
     ) -> dict[tuple[int,int], int]:
@@ -228,7 +365,7 @@ class TokenizerTrainer():
         
         return freq
 
-    def merge_pair(
+    def _merge_pair(
         self,
         mapped_words: list[list[int]],
         pair: tuple[int,int],
@@ -245,54 +382,9 @@ class TokenizerTrainer():
                 new_word.append(x)
             mapped_words[idx] = new_word
 
-    def train_bpe_baseline(
-        self,
-        input_path: str | os.PathLike,
-    ) -> tuple[
-        dict[int,bytes],
-        list[tuple[bytes, bytes]],
-    ]:
-        """Train Byte-pair Encoder, given corpus path & targeted vocab_size
+    # === train_bpe specific helpers ======================================================================
 
-        Args:
-            - input_path : Path to corpus
-            - vocab_size : Targetted output vocab size
-            - special_tokens : List of special tokens
-
-        Returns:
-            - vocab: dict[int, bytes] : The resulting vocab after BPE merge
-            - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
-        
-        """
-        # Initializing vocab (all bytes & special tokens)
-        vocab = self.init_vocab()
-        merges = []
-
-        # Pretokenize corpus
-        pretokenizer = Pretokenizer(self.special_tokens)
-        words = pretokenizer.pretokenize(input_path)
-        mapped_words = [self.map_word(word) for word in words]
-
-        # Start merging adjacent pairs
-        while (len(vocab) < self.vocab_size):
-            freq = self.get_freq(mapped_words)
-            try:
-                max_pair = max(freq, key=lambda k: (freq[k],(vocab[k[0]], vocab[k[1]])))
-            except ValueError:
-                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(vocab)}")
-            key = len(vocab)
-            value = vocab[max_pair[0]] + vocab[max_pair[1]]
-            vocab[key] = value
-
-            merges.append((vocab[max_pair[0]], vocab[max_pair[1]]))
-
-            self.merge_pair(mapped_words, max_pair, key)
-
-        return vocab, merges
-
-    # === train_bpe specific ============================================================================
-
-    def create_mapping(
+    def _create_mapping(
         self,
         words: list[str]
     ) -> list[list[int]]:
@@ -301,10 +393,10 @@ class TokenizerTrainer():
             if word in self.special_tokens:
                 res.append([TokenizerTrainer.BASE_VOCAB_SIZE + self.special_tokens.index(word) for i in range(len(word.encode()))])
             else:
-                res.append(self.map_word(word))
+                res.append(self._map_word(word))
         return res
 
-    def init_inverted_records(
+    def _init_inverted_records(
         self,
         mapping: list[list[int]]
     ) -> tuple[dict[tuple[int,int], int], dict[tuple[int,int], list[tuple[int,int]]]]:
@@ -314,7 +406,7 @@ class TokenizerTrainer():
         for i in range(len(mapping)):
             word = mapping[i]
             l = 0
-            r = self.advance_token_word(word, 0)
+            r = self._advance_token_word(word, 0)
             while r < len(word):
                 pair = (word[l], word[r])
                 if pair not in freq:
@@ -324,19 +416,17 @@ class TokenizerTrainer():
                 record[pair].append((i,l))
 
 
-                l = self.advance_token_word(word, l)
-                r = self.advance_token_word(word, r)
+                l = self._advance_token_word(word, l)
+                r = self._advance_token_word(word, r)
         
         return freq, record
 
-    def add_pair(
+    def _add_pair(
         self,
         mapping,
         freq,
         record,
-        i,
-        l,
-        r,
+        i, l, r,
     ):
         n_pair = (mapping[i][l], mapping[i][r])
         if n_pair not in freq:
@@ -345,7 +435,7 @@ class TokenizerTrainer():
         freq[n_pair] += 1
         record[n_pair].append((i,l))
 
-    def merge_record(
+    def _merge_record(
         self,
         mapping: list[list[int]],
         freq: dict[tuple[int,int], int],
@@ -354,75 +444,28 @@ class TokenizerTrainer():
         key: int,
     ) -> None:
         for i, l in record[pair]:
-            r = self.advance_token_id(pair[0], l)
+            r = self._advance_token_id(pair[0], l)
             if mapping[i][l] != pair[0] or mapping[i][r] != pair[1]:
                 continue
 
             if (l!=0):
                 freq[(mapping[i][l-1], mapping[i][l])] -= 1
-            if self.advance_token_word(mapping[i], r) != len(mapping[i]):
-                freq[(mapping[i][r], mapping[i][self.advance_token_word(mapping[i], r)])] -= 1
+            if self._advance_token_word(mapping[i], r) != len(mapping[i]):
+                freq[(mapping[i][r], mapping[i][self._advance_token_word(mapping[i], r)])] -= 1
 
-            for idx in range(l, self.advance_token_word(mapping[i], r)):
+            for idx in range(l, self._advance_token_word(mapping[i], r)):
                 mapping[i][idx] = key
 
             if (l!=0):
                 prev = l - len(self.vocab[mapping[i][l-1]])
-                self.add_pair(mapping, freq, record, i, prev, l)
+                self._add_pair(mapping, freq, record, i, prev, l)
 
-            if self.advance_token_word(mapping[i], l) != len(mapping[i]):
-                post = self.advance_token_word(mapping[i], l)
-                self.add_pair(mapping, freq, record, i, l, post)
+            if self._advance_token_word(mapping[i], l) != len(mapping[i]):
+                post = self._advance_token_word(mapping[i], l)
+                self._add_pair(mapping, freq, record, i, l, post)
 
         freq.pop(pair, None)
         record.pop(pair, None)
-
-    def train_bpe(
-        self,
-        input_path: str | os.PathLike,
-    ) -> tuple[
-        dict[int,bytes],
-        list[tuple[bytes, bytes]],
-    ]:
-        """Train Byte-pair Encoder, given corpus path & targeted vocab_size
-
-        Args:
-            - input_path : Path to corpus
-            - vocab_size : Targetted output vocab size
-            - special_tokens : List of special tokens
-
-        Returns:
-            - vocab: dict[int, bytes] : The resulting vocab after BPE merge
-            - merges: list[tuple[bytes, bytes]] : List of BPE merges produces from training
-        
-        """
-
-        # Initializing vocab (all bytes & special tokens)
-        self.vocab = self.init_vocab()
-        merges = []
-
-        # Pretokenize corpus
-        pretokenizer = Pretokenizer(self.special_tokens)
-        words = pretokenizer.pretokenize(input_path)
-
-        mapping = self.create_mapping(words)
-        freq, record = self.init_inverted_records(mapping)
-
-        # Start merging adjacent pairs
-        while (len(self.vocab) < self.vocab_size):
-            try:
-                max_pair = max(freq, key=lambda k: (freq[k],(self.vocab[k[0]], self.vocab[k[1]])))
-            except ValueError:
-                raise ValueError(f"Unable to create vocab of size {self.vocab_size}: Max size is {len(self.vocab)}")
-            key = len(self.vocab)
-            value = self.vocab[max_pair[0]] + self.vocab[max_pair[1]]
-            self.vocab[key] = value
-
-            merges.append((self.vocab[max_pair[0]], self.vocab[max_pair[1]]))
-
-            self.merge_record(mapping, freq, record, max_pair, key)
-
-        return self.vocab, merges
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -435,6 +478,69 @@ def train_bpe(
     return trainer.train_bpe(input_path)
 
 class Tokenizer():
+
+    # === Front facing APIs ======================================================================================
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None
+    ) -> None:
+        self.vocab = vocab
+        self.inv_vocab = {}
+        for key in vocab:
+            self.inv_vocab[vocab[key]] = key
+
+        self.special_tokens = special_tokens if special_tokens != None else []
+        for special_token in self.special_tokens:
+            encoded_token = special_token.encode()
+            if encoded_token not in self.inv_vocab:
+                key = len(vocab)
+                self.vocab[key] = encoded_token
+                self.inv_vocab[encoded_token] = key
+
+        self.merges = {
+            (self.inv_vocab[merges[i][0]], self.inv_vocab[merges[i][1]]):
+            (i, self.inv_vocab[merges[i][0] + merges[i][1]])
+        for i in range(len(merges))}
+
+        self.pretokenizer = Pretokenizer(self.special_tokens)
+
+    def encode(
+        self,
+        text: str,
+    ) -> list[int]:
+        """Remember: split the chunk by special char, where special char is its own element.
+        """
+
+        words = self.pretokenizer.pretokenize(text, 1, False, True)
+        mapping = self._create_mapping(words)
+        records, heap = self._init_inverted_records(mapping)
+        
+        while not heap.empty():
+            _, pair = heap.get()
+            if pair in self.merges and pair in records:
+                key = self.merges[pair][1]
+                self._merge_record(mapping, records, heap, pair, key)
+
+        compressed = self._compress_mapping(mapping)
+        return [key for word in compressed for key in word]
+
+    def encode_iterable(
+        self,
+        iterable: Iterable[str]
+    ) -> Iterator[int]:
+        return Tokenizer.TokenIterator(iterable, self)
+
+    def decode(
+        self,
+        ids: list[int]
+    ) -> str:
+        res = bytearray()
+        for id in ids:
+            res.extend(self.vocab[id])
+        return bytes(res).decode(encoding='utf-8', errors='replace')
 
     # === Static Helpers ====================================================================
 
@@ -502,32 +608,6 @@ class Tokenizer():
         return sorted(set(chunk_boundaries))
 
     # === Instantiation =================================================================================
-
-    def __init__(
-        self,
-        vocab: dict[int, bytes],
-        merges: list[tuple[bytes, bytes]],
-        special_tokens: list[str] | None = None
-    ) -> None:
-        self.vocab = vocab
-        self.inv_vocab = {}
-        for key in vocab:
-            self.inv_vocab[vocab[key]] = key
-
-        self.special_tokens = special_tokens if special_tokens != None else []
-        for special_token in self.special_tokens:
-            encoded_token = special_token.encode()
-            if encoded_token not in self.inv_vocab:
-                key = len(vocab)
-                self.vocab[key] = encoded_token
-                self.inv_vocab[encoded_token] = key
-
-        self.merges = {
-            (self.inv_vocab[merges[i][0]], self.inv_vocab[merges[i][1]]):
-            (i, self.inv_vocab[merges[i][0] + merges[i][1]])
-        for i in range(len(merges))}
-
-        self.pretokenizer = Pretokenizer(self.special_tokens)
 
     @classmethod
     def from_files(
@@ -705,40 +785,3 @@ class Tokenizer():
             self,
         ):
             return self
-
-    # === Front facing APIs ======================================================================================
-
-    def encode(
-        self,
-        text: str,
-    ) -> list[int]:
-        """Remember: split the chunk by special char, where special char is its own element.
-        """
-
-        words = self.pretokenizer.pretokenize(text, 1, False, True)
-        mapping = self._create_mapping(words)
-        records, heap = self._init_inverted_records(mapping)
-        
-        while not heap.empty():
-            _, pair = heap.get()
-            if pair in self.merges and pair in records:
-                key = self.merges[pair][1]
-                self._merge_record(mapping, records, heap, pair, key)
-
-        compressed = self._compress_mapping(mapping)
-        return [key for word in compressed for key in word]
-
-    def encode_iterable(
-        self,
-        iterable: Iterable[str]
-    ) -> Iterator[int]:
-        return Tokenizer.TokenIterator(iterable, self)
-
-    def decode(
-        self,
-        ids: list[int]
-    ) -> str:
-        res = bytearray()
-        for id in ids:
-            res.extend(self.vocab[id])
-        return bytes(res).decode(encoding='utf-8', errors='replace')

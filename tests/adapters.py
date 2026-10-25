@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from collections import OrderedDict
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -9,7 +10,13 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from cs336_basics import tokenizer
+from cs336_basics import tokenizer, base
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    else:
+        return torch.device("cpu")
 
 def run_linear(
     d_in: int,
@@ -30,7 +37,13 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = base.Linear(d_in, d_out)
+    state_dict = OrderedDict({
+        'A': weights
+    })
+    linear.load_state_dict(state_dict)
+
+    return linear.forward(in_features)
 
 
 def run_embedding(
@@ -52,7 +65,13 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding = base.Embedding(vocab_size, d_model)
+    state_dict = OrderedDict({
+        'weights': weights
+    })
+    embedding.load_state_dict(state_dict)
+
+    return embedding(token_ids)
 
 
 def run_swiglu(

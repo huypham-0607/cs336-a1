@@ -33,7 +33,7 @@ class Linear(nn.Module):
     ) -> torch.Tensor:
         return einsum(x, self.A, "... j, k j -> ... k")
 
-class Embedding(torch.nn.Module):
+class Embedding(nn.Module):
     """Map a index (token id) to a dense vector representation
     """
     def __init__(
@@ -63,3 +63,34 @@ class Embedding(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self.weights[x]
+
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.device = device
+        self.dtype = dtype
+
+        self.g = nn.Parameter(
+            torch.ones(size=[self.d_model], device=self.device, dtype=self.dtype)
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+
+        rms = (x.square().sum(dim=-1)*(1.0/self.d_model) + self.eps).sqrt()
+        res = einsum(x, rms, self.g, "... d_model, ..., d_model -> ... d_model")
+
+        res = res.to(x.dtype)
+        return res
